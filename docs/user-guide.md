@@ -27,6 +27,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [Cognitum Seed Integration (ADR-069)](#cognitum-seed-integration-adr-069)
 5. [REST API Reference](#rest-api-reference)
 6. [WebSocket Streaming](#websocket-streaming)
+7. [Real-Time Introspection Tap (ADR-099)](#real-time-introspection-tap-adr-099)
 7. [RuView npm toolkit (`@ruvnet/ruview`)](#ruview-npm-toolkit-ruvnetruview)
    - [Hardware from the command line](#hardware-from-the-command-line)
    - [MCP for agents, ChatGPT and MCP Apps](#mcp-for-agents-chatgpt-and-mcp-apps)
@@ -49,10 +50,10 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 14. [Hardware Setup](#hardware-setup)
     - [ESP32-S3 Mesh](#esp32-s3-mesh)
     - [Intel 5300 / Atheros NIC](#intel-5300--atheros-nic)
-15. [Camera-Free Pose Training](#camera-free-pose-training)
-16. [ruvllm Training Pipeline](#ruvllm-training-pipeline)
-17. [Docker Compose (Multi-Service)](#docker-compose-multi-service)
-16. [Testing Firmware Without Hardware (QEMU)](#testing-firmware-without-hardware-qemu)
+16. [Camera-Free Pose Training](#camera-free-pose-training)
+17. [ruvllm Training Pipeline](#ruvllm-training-pipeline)
+18. [Docker Compose (Multi-Service)](#docker-compose-multi-service)
+19. [Testing Firmware Without Hardware (QEMU)](#testing-firmware-without-hardware-qemu)
     - [What You Need](#what-you-need)
     - [Your First Test Run](#your-first-test-run)
     - [Understanding the Test Output](#understanding-the-test-output)
@@ -1188,6 +1189,66 @@ Design records:
 
 ---
 
+## Real-Time Introspection Tap (ADR-099)
+
+The introspection tap is an optional parallel analysis channel that applies temporal-attractor analysis (Lyapunov exponent, regime classification) and DTW pattern matching to each CSI frame — without affecting the main `/ws/sensing` event pipeline.
+
+Enable with `--introspection`:
+
+```bash
+./target/release/sensing-server --source simulate --http-port 3000 --introspection
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/ws/introspection` | WebSocket | Newline-delimited JSON snapshots streamed at the CSI frame rate |
+| `/api/v1/introspection/snapshot` | GET | Single-shot JSON snapshot (auth-gated if `RUVIEW_API_TOKEN` is set) |
+
+### Snapshot Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `frame_count` | u64 | Total frames processed since server start |
+| `regime` | string | Signal regime: `Idle`, `Periodic`, `Transient`, `Chaotic`, or `Unknown` |
+| `lyapunov_exponent` | f64 | Lyapunov exponent of the attractor (negative = stable, positive = chaotic) |
+| `attractor_dim` | f64 | Estimated attractor dimension |
+| `attractor_confidence` | f64 | Confidence in the regime classification (0.0–1.0) |
+| `regime_changed` | bool | `true` on the first frame after a regime transition |
+| `top_k_similarity` | array | Highest-scoring DTW signature matches from the deployment library |
+
+### Example
+
+```bash
+# Stream introspection snapshots via WebSocket (requires wscat)
+wscat -c ws://localhost:3000/ws/introspection
+
+# Single snapshot via HTTP
+curl http://localhost:3000/api/v1/introspection/snapshot | python -m json.tool
+```
+
+```json
+{
+    "frame_count": 1042,
+    "regime": "Periodic",
+    "lyapunov_exponent": -0.21,
+    "attractor_dim": 1.83,
+    "attractor_confidence": 0.94,
+    "regime_changed": false,
+    "top_k_similarity": [
+        {"signature": "breathing_6bpm", "score": 0.87},
+        {"signature": "walking", "score": 0.41}
+    ]
+}
+```
+
+**Performance:** Per-frame `update()` latency is ≤0.041 ms p99, well within the 1 ms ADR-099 D4 budget.
+
+**Note:** The tap is off by default. When disabled, neither endpoint is registered and there is no overhead on the sensing pipeline.
+
+---
+
 ## Web UI
 
 The built-in Three.js UI is served at `http://localhost:3000/ui/` (Docker) or the configured HTTP port.
@@ -1363,6 +1424,17 @@ The Rust sensing server binary accepts the following flags:
 | `--model` | (none) | Load a trained `.rvf` model for inference |
 | `--load-rvf` | (none) | Load model config from RVF container |
 | `--progressive` | off | Enable progressive 3-layer model loading |
+| `--introspection` | off | Enable real-time introspection tap (ADR-099): exposes `/ws/introspection` and `/api/v1/introspection/snapshot` |
+
+**Bearer-token auth:** Set the `RUVIEW_API_TOKEN` environment variable to require an `Authorization: Bearer <token>` header on all `/api/v1/*` requests. Unset (default) = no auth. `/health`, `/ws/sensing`, and static UI files are always unauthenticated.
+
+```bash
+# Start with auth enabled
+RUVIEW_API_TOKEN=mysecrettoken ./target/release/sensing-server --source simulate --http-port 3000
+
+# Authenticated request
+curl -H "Authorization: Bearer mysecrettoken" http://localhost:3000/api/v1/vital-signs
+```
 
 ### Common Invocations
 
@@ -2806,6 +2878,31 @@ Firmware versions prior to v0.4.1 had `CONFIG_ESP_WIFI_CSI_ENABLED` disabled in 
 4. Verify UDP port 5005 is not blocked by firewall
 5. Test with: `nc -lu 5005` (Linux) or similar UDP listener
 
+### Windows: OpenBLAS build failure
+
+The default `cargo build --release` fails on Windows without OpenBLAS (vcpkg):
+
+```
+error: failed to run custom build command for `openblas-src`
+Non-vcpkg builds are not supported on Windows.
+```
+
+**Workaround — build without the BLAS-dependent features** (covers all sensing, vital signs, and API functionality):
+
+```bash
+cd v2
+cargo build --release -p wifi-densepose-sensing-server --no-default-features
+```
+
+This is identical to the flags used by the test suite. If you need full BLAS support, install OpenBLAS via vcpkg first:
+
+```bash
+# Install vcpkg then:
+vcpkg install openblas:x64-windows
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+cargo build --release
+```
+
 ### Build: Rust compilation errors
 
 Ensure Rust 1.75+ is installed (1.85+ recommended):
@@ -2948,7 +3045,7 @@ ARM64 deployment is planned ([ADR-046](adr/ADR-046-android-tv-box-armbian-deploy
 
 ## Further Reading
 
-- [Architecture Decision Records](../docs/adr/) - 48 ADRs covering all design decisions
+- [Architecture Decision Records](../docs/adr/) - 97 ADRs covering all design decisions
 - [WiFi-Mat Disaster Response Guide](wifi-mat-user-guide.md) - Search & rescue module
 - [Build Guide](build-guide.md) - Detailed build instructions
 - [RuVector](https://github.com/ruvnet/ruvector) - Signal intelligence crate ecosystem
